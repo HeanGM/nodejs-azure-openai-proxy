@@ -26,7 +26,7 @@ if (!AZURE_KEY || !AZURE_ENDPOINT || !AZURE_DEPLOYMENT) {
 }
 
 // allow requests from your React client origin - set it in env if you want
-const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || '*'; // for production change to exact origin
+const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN; // for production change to exact origin
 
 // minimal middlewares
 app.use(cors({ origin: CLIENT_ORIGIN }));
