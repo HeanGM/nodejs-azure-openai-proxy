@@ -79,7 +79,7 @@ function verifyJwt(req, res, next) {
 }
 
 // ---------- Proxy helpers ----------
-async function azureFetch(path, body) {
+async function azureFetch(path = "chat/completions", body) {
   if (!AZURE_ENDPOINT || !AZURE_KEY || !AZURE_DEPLOYMENT) {
     throw new Error('Azure OpenAI configuration missing');
   }
