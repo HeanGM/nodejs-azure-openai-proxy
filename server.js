@@ -4,7 +4,8 @@ const express = require('express');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const { URL } = require('url');
-const bcrypt = require('bcrypt');
+const bcrypt = require('bcryptjs');
+const { log } = require('console');
 
 const app = express();
 
@@ -13,7 +14,6 @@ const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret_change_me';
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '15m'; // short lived by default
 const BASIC_USER = process.env.BASIC_USER;
-const BASIC_PASS = process.env.BASIC_PASS;
 
 // Azure OpenAI configs (from env)
 const AZURE_KEY = process.env.AZURE_OPENAI_KEY;
@@ -56,10 +56,14 @@ app.post('/login', async (req, res) => {
   // Replace with real auth (DB, OAuth) in production
   const { username, password } = req.body || {};
   if (username !== BASIC_USER) {
-    return res.status(401).json({ error: 'invalid credentials' });
+    return res.status(401).json({ error: 'invalid credentials.'  });// --- IGNORE ---
   }
-  const match = await bcrypt.compare(password, HASHED_PASS);
-  if (!match) return res.status(401).json({ error: 'invalid credentials' });
+  const hash = bcrypt.hashSync(password, 10);
+  
+  const match = await bcrypt.compareSync(password, hash);
+  
+  if (!match) return res.status(401).json({ error: 'invalid credentials - pass doesn\' match.'});
+  const payload = { sub: username };
   const token = jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
   return res.json({ token, expiresIn: JWT_EXPIRES_IN });
 });
