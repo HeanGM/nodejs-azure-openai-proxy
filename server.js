@@ -41,7 +41,7 @@ if (!OPENAI_KEY) {
 
 // React client origin
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN;
-app.use(cors({ origin: CLIENT_ORIGIN ? [CLIENT_ORIGIN] : '*' }));
+app.use(cors({ origin: CLIENT_ORIGIN ? [CLIENT_ORIGIN, "http://localhost:5173"] : '*' }));
 app.use(express.json({ limit: '50kb' }));
 app.set('trust proxy', true);
 
