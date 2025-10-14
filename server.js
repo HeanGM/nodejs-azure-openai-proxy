@@ -1,48 +1,41 @@
 // server.js
 require('dotenv').config();
 const express = require('express');
-const jwt = require('jsonwebtoken');
 const cors = require('cors');
-const { URL } = require('url');
-const bcrypt = require('bcryptjs');
 const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 const { Pool } = require('pg');
+const { createClient } = require('redis');
+const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 
 // -------------------- CONFIG --------------------
 const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret_change_me';
-const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '4h';
-// const WHICH_TO_USE = process.env.WHICH_TO_USE || 'azure'; // 'azure' or 'openai'
-// if (process.env.NODE_ENV === 'production' && (!process.env.VALID_USER || !process.env.VALID_PASS_HASH)) {
-//   throw new Error('Missing VALID_USER or VALID_PASS_HASH in production environment');
-// }
-// const VALID_USER = process.env.VALID_USER;
-// const VALID_PASS_HASH = process.env.VALID_PASS_HASH;
-
-// Azure OpenAI
-// const AZURE_KEY = process.env.AZURE_OPENAI_KEY;
-// const AZURE_ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT;
-// const AZURE_DEPLOYMENT = process.env.AZURE_OPENAI_DEPLOYMENT;
-const AZURE_API_VERSION = process.env.AZURE_OPENAI_API_VERSION || '2023-11-15-preview';
 
 // OpenAI Direct
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_ORG = process.env.OPENAI_ORG_ID; // optional.
 const TOKEN_LIMIT_PER_MINUTE = parseInt(process.env.TOKEN_LIMIT_PER_MINUTE) || 2000;
 
-// if (!AZURE_KEY || !AZURE_ENDPOINT || !AZURE_DEPLOYMENT) {
-//   console.warn('Warning: AZURE_OPENAI_* environment vars missing.');
-// }
 if (!OPENAI_KEY) {
   console.warn('Warning: OPENAI_API_KEY missing.');
 }
 
+// Session settings
+const SESSION_TTL_SECONDS = parseInt(process.env.SESSION_TTL_SECONDS || '60') * 60; // default 60 min
+const SESSION_LIMIT = parseInt(process.env.SESSION_LIMIT || '150'); // active sessions cap
+
+// Redis
+const REDIS_URL = process.env.REDIS_URL; // e.g. redis://:pass@host:port
+if (!REDIS_URL) console.warn('Warning: REDIS_URL is not set.');
+const redis = createClient({ url: REDIS_URL, socket: { tls: true, rejectUnauthorized:false } });
+redis.on('error', (err) => console.error('Redis error', err));
+
 // React client origin
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN;
-app.use(cors({ origin: CLIENT_ORIGIN ? [CLIENT_ORIGIN, "http://localhost:5173"] : '*' }));
-app.use(express.json({ limit: '50kb' }));
+// app.use(cors({ origin: CLIENT_ORIGIN ? [CLIENT_ORIGIN] : '*' }));
+app.use(cors({ origin: '*' }));
+app.use(express.json({ limit: '100kb' }));
 app.set('trust proxy', true);
 
 // -------------------- POSTGRES CONNECTION --------------------
@@ -69,6 +62,161 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejec
 //   timestamp TIMESTAMPTZ DEFAULT NOW(),
 //   tokens INTEGER NOT NULL
 // );
+
+// Redis keys
+const SESSIONS_SET = 'sessions:active'; // Set of active session IDs
+const SESSIONS_Z = 'sessions:z';        // ZSET of session IDs scored by expiry timestamp (ms)
+const SESSION_KEY = (id) => `session:${id}`; // volatile key with TTL
+
+async function initRedis() {
+  try {
+    if (!redis.isOpen) {
+      await redis.connect();
+      console.log('✅ Redis connected');
+    }
+  } catch (err) {
+    console.error('Redis connection failed:', err.message);
+    process.exit(1); // optional: fail hard if Redis is required
+  }
+}
+
+// Connect at startup
+(async () => {
+  await initRedis();
+})();
+
+process.on('SIGTERM', async () => {
+  console.log('Shutting down, closing Redis connection...');
+  if (redis.isOpen) await redis.quit();
+  process.exit(0);
+});
+
+// Remove expired sessions (based on ZSET); keep SESSIONS_SET clean.
+async function purgeExpiredSessions() {
+  const now = Date.now();
+  // Pop expired ids from ZSET
+  const expiredIds = await redis.zRangeByScore(SESSIONS_Z, 0, now);
+  if (expiredIds.length > 0) {
+    const pipeline = redis.multi();
+    pipeline.zRem(SESSIONS_Z, expiredIds);
+    pipeline.sRem(SESSIONS_SET, expiredIds);
+    expiredIds.forEach((id) => pipeline.del(SESSION_KEY(id))); // in case still there
+    await pipeline.exec();
+  }
+}
+
+async function getActiveCount() {
+  // Ensure we remove expired first, then count
+  await purgeExpiredSessions();
+  return await redis.sCard(SESSIONS_SET);
+}
+
+async function createSession() {
+  await purgeExpiredSessions();
+  const active = await redis.sCard(SESSIONS_SET);
+  if (active >= SESSION_LIMIT) {
+    return { ok: false, reason: 'capacity' };
+  }
+
+  const id = uuidv4();
+  const expiresAtMs = Date.now() + SESSION_TTL_SECONDS * 1000;
+
+  const pipeline = redis.multi();
+  pipeline.sAdd(SESSIONS_SET, id);
+  pipeline.zAdd(SESSIONS_Z, [{ score: expiresAtMs, value: id }]);
+  pipeline.set(SESSION_KEY(id), '1', { EX: SESSION_TTL_SECONDS }); // TTL auto-expire
+  await pipeline.exec();
+
+  return { ok: true, id, expiresAt: new Date(expiresAtMs).toISOString() };
+}
+
+async function touchSession(sessionId) {
+  // optional: refresh TTL on activity (comment out if you want fixed duration)
+  if (!sessionId) return;
+  const exists = await redis.exists(SESSION_KEY(sessionId));
+  if (exists) {
+    await redis.expire(SESSION_KEY(sessionId), SESSION_TTL_SECONDS);
+    const newExp = Date.now() + SESSION_TTL_SECONDS * 1000;
+    await redis.zAdd(SESSIONS_Z, [{ score: newExp, value: sessionId }]);
+  }
+}
+
+async function deleteSession(sessionId) {
+  if (!sessionId) return;
+  const pipeline = redis.multi();
+  pipeline.sRem(SESSIONS_SET, sessionId);
+  pipeline.zRem(SESSIONS_Z, sessionId);
+  pipeline.del(SESSION_KEY(sessionId));
+  await pipeline.exec();
+}
+
+// -------------------- MIDDLEWARE --------------------
+// app.use(async (req, res, next) => {
+//   if (process.env.NODE_ENV === 'production') {
+//     const proto = req.get('x-forwarded-proto') || req.protocol;
+//     if (proto !== 'https') {
+//       const host = req.get('host');
+//       const originalUrl = req.originalUrl || '/';
+//       return res.redirect(301, `https://${host}${originalUrl}`);
+//     }
+//   }
+//   next();
+// });
+
+// Health + basic stats
+app.get('/health', async (req, res) => {
+  try {
+    const count = await getActiveCount();
+    res.json({ ok: true, activeSessions: count, limit: SESSION_LIMIT });
+  } catch {
+    res.json({ ok: true });
+  }
+});
+
+// Require a valid session for model calls
+async function requireSession(req, res, next) {
+  const sessionId = req.get('x-session-id');
+  if (!sessionId) return res.status(401).json({ error: 'Missing x-session-id' });
+
+  const exists = await redis.exists(SESSION_KEY(sessionId));
+  if (!exists) return res.status(401).json({ error: 'Invalid or expired session' });
+
+  // touch (optional) to keep it alive while user is active
+  await touchSession(sessionId);
+
+  req.sessionId = sessionId;
+  next();
+}
+
+// -------------------- SESSION ROUTES --------------------
+app.post('/sessions', async (req, res) => {
+  try {
+    const result = await createSession();
+    console.log('debugger');
+    if (!result.ok && result.reason === 'capacity') {
+      const count = await getActiveCount();
+      return res.status(409).json({ error: 'No capacity available', active: count, limit: SESSION_LIMIT });
+    }
+    return res.status(201).json({ sessionId: result.id, expiresAt: result.expiresAt, ttlSeconds: SESSION_TTL_SECONDS });
+  }
+  catch (err) {
+    console.error('Create session error:', err.message);
+    return res.status(500).json({ error: err });
+  }
+});
+
+// Delete session (logout)
+app.delete('/sessions/:id', async (req, res) => {
+  const sessionId = req.params.id;
+  if (!sessionId) return res.status(400).json({ error: 'Missing session id' });
+  try {
+    await deleteSession(sessionId);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('Delete session error:', err.message);
+    return res.status(500).json({ error: 'Internal error' });
+  }
+});
 
 async function updateTokenUsage(totalTokens) {
   const minute = new Date();
@@ -124,55 +272,6 @@ app.use((req, res, next) => {
 // Health check
 app.get('/health', (req, res) => res.json({ ok: true }));
 
-// -------------------- AUTH /login --------------------
-// app.post('/login', (req, res) => {
-//   const { username, password } = req.body || {};
-//   if (!username || !password) return res.status(400).json({ error: 'Missing username or password' });
-
-//   if (username !== VALID_USER)
-//     return res.status(401).json({ error: 'Invalid credentials' + username + ' . ' + VALID_USER });
-
-//   const match = bcrypt.compareSync(password, VALID_PASS_HASH);
-//   if (!match)
-//     return res.status(401).json({ error: 'Invalid credentials' });
-
-//   const token = jwt.sign({ sub: username }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
-//   return res.json({ token, expiresIn: JWT_EXPIRES_IN });
-// });
-
-// JWT verification middleware
-function verifyJwt(req, res, next) {
-  // const auth = req.get('authorization') || '';
-  // const match = auth.match(/^Bearer (.+)$/);
-  // if (!match) return res.status(401).json({ error: 'missing or invalid authorization header' });
-
-  // jwt.verify(match[1], JWT_SECRET, (err, decoded) => {
-  //   if (err) return res.status(401).json({ error: 'invalid token' });
-  //   req.user = decoded;
-  //   next();
-  // });
-
-  next();
-}
-
-// -------------------- Azure OpenAI fetch - Keeping for future --------------------
-// async function azureFetch(path = 'chat/completions', body) {
-//   if (!AZURE_ENDPOINT || !AZURE_KEY || !AZURE_DEPLOYMENT) throw new Error('Azure OpenAI config missing');
-
-//   const url = new URL(`${AZURE_ENDPOINT.replace(/\/$/, '')}/openai/deployments/${AZURE_DEPLOYMENT}/${path}`);
-//   url.searchParams.set('api-version', AZURE_API_VERSION);
-
-//   const resp = await fetch(url.toString(), {
-//     method: 'POST',
-//     headers: { 'Content-Type': 'application/json', 'api-key': AZURE_KEY },
-//     body: JSON.stringify(body)
-//   });
-
-//   const text = await resp.text();
-//   let parsed;
-//   try { parsed = JSON.parse(text); } catch { parsed = { raw: text }; }
-//   return { status: resp.status, body: parsed };
-// }
 
 // -------------------- OpenAI fetch --------------------
 async function openAIFetch(path = 'chat/completions', body) {
@@ -197,7 +296,7 @@ async function openAIFetch(path = 'chat/completions', body) {
 }
 
 // -------------------- Proxy endpoint --------------------
-app.post('/chat/completions', verifyJwt, async (req, res) => {
+app.post('/chat/completions', requireSession, async (req, res) => {
   try {
     // ✅ NEW: check if limit reached before calling model
     const allowed = await canProceedWithRequest();
