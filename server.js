@@ -111,7 +111,6 @@ async function canProceedWithRequest(limit = TOKEN_LIMIT_PER_MINUTE) {
 // HTTPS enforcement
 app.use((req, res, next) => {
   if (process.env.NODE_ENV === 'production') {
-    res.header('Access-Control-Allow-Origin', '*'); // Or '*' for all origins
     const proto = req.get('x-forwarded-proto') || req.protocol;
     if (proto !== 'https') {
       const host = req.get('host');
@@ -201,7 +200,7 @@ async function openAIFetch(path = 'chat/completions', body) {
 app.post('/chat/completions', verifyJwt, async (req, res) => {
   try {
     // ✅ NEW: check if limit reached before calling model
-    const allowed = await canProceedWithRequest(100);
+    const allowed = await canProceedWithRequest();
     if (!allowed) {
       return res.status(429).json({ error: 'Token limit reached. Please wait a minute and try again. Allowed Tokens per Min: ' + TOKEN_LIMIT_PER_MINUTE });
     }
